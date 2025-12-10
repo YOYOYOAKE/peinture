@@ -1,10 +1,10 @@
 
+
 import { GeneratedImage, AspectRatioOption, ModelOption } from "../types";
-import { generateUUID } from "./utils";
+import { generateUUID, getSystemPromptContent, FIXED_SYSTEM_PROMPT_SUFFIX, getOptimizationModel } from "./utils";
 
 const MS_GENERATE_API_URL = "https://api-inference.modelscope.cn/v1/images/generations";
 const MS_CHAT_API_URL = "https://api-inference.modelscope.cn/v1/chat/completions";
-const MS_TASK_API_URL = "https://api-inference.modelscope.cn/v1/tasks";
 
 // --- Token Management System ---
 
@@ -166,25 +166,6 @@ const getDimensions = (ratio: AspectRatioOption, enableHD: boolean): { width: nu
 
 // --- Service Logic ---
 
-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
-const checkTaskStatus = async (taskId: string, token: string): Promise<any> => {
-  const response = await fetch(`${MS_TASK_API_URL}/${taskId}`, {
-    method: 'GET',
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${token}`,
-      "X-ModelScope-Task-Type": "image_generation"
-    }
-  });
-
-  if (!response.ok) {
-    throw new Error(`Model Scope Task Check Error: ${response.status}`);
-  }
-
-  return response.json();
-};
-
 export const generateMSImage = async (
   model: ModelOption,
   prompt: string,
@@ -193,20 +174,21 @@ export const generateMSImage = async (
   steps?: number,
   enableHD: boolean = false
 ): Promise<GeneratedImage> => {
-  const { width, height } = getDimensions(aspectRatio, enableHD);
+  // Only apply HD settings if the model is Z-Image Turbo
+  const shouldUseHD = enableHD && model === 'Tongyi-MAI/Z-Image-Turbo';
+  
+  const { width, height } = getDimensions(aspectRatio, shouldUseHD);
   const finalSeed = seed ?? Math.floor(Math.random() * 2147483647);
   const finalSteps = steps ?? 9; 
   const sizeString = `${width}x${height}`;
 
   return runWithMsTokenRetry(async (token) => {
     try {
-      // 1. Submit async task
       const response = await fetch(MS_GENERATE_API_URL, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`,
-          "X-ModelScope-Async-Mode": "true"
+          "Authorization": `Bearer ${token}`
         },
         body: JSON.stringify({
           prompt,
@@ -222,49 +204,25 @@ export const generateMSImage = async (
         throw new Error(errData.message || `Model Scope API Error: ${response.status}`);
       }
 
-      const initialData = await response.json();
-      const taskId = initialData.task_id;
+      const data = await response.json();
+      
+      const imageUrl = data.images?.[0]?.url;
 
-      if (!taskId) {
+      if (!imageUrl) {
           throw new Error("error_invalid_response");
       }
 
-      // 2. Poll for status
-      let attempts = 0;
-      const maxAttempts = 60; // 60 * 2s = 120s timeout
-      
-      while (attempts < maxAttempts) {
-          await sleep(2000); // Wait 2 seconds
-          
-          const taskStatus = await checkTaskStatus(taskId, token);
-          
-          if (taskStatus.task_status === 'SUCCEED') {
-              // Task done
-              const imageUrl = taskStatus.output_images?.[0];
-              if (!imageUrl) {
-                 throw new Error("error_invalid_response");
-              }
-
-              return {
-                id: generateUUID(),
-                url: imageUrl,
-                model,
-                prompt,
-                aspectRatio,
-                timestamp: Date.now(),
-                seed: finalSeed,
-                steps: finalSteps,
-                provider: 'modelscope'
-              };
-
-          } else if (taskStatus.task_status === 'FAILED' || taskStatus.task_status === 'CANCELED') {
-              throw new Error("error_invalid_response");
-          }
-          // If PENDING or RUNNING, continue loop
-          attempts++;
-      }
-      
-      throw new Error("error_api_connection");
+      return {
+        id: generateUUID(),
+        url: imageUrl,
+        model,
+        prompt,
+        aspectRatio,
+        timestamp: Date.now(),
+        seed: finalSeed,
+        steps: finalSteps,
+        provider: 'modelscope'
+      };
 
     } catch (error) {
       console.error("Model Scope Image Generation Error:", error);
@@ -276,6 +234,11 @@ export const generateMSImage = async (
 export const optimizePromptMS = async (originalPrompt: string, lang: string): Promise<string> => {
   return runWithMsTokenRetry(async (token) => {
     try {
+      const model = getOptimizationModel('modelscope');
+      // Append the fixed suffix to the user's custom system prompt
+      const activePromptContent = getSystemPromptContent() + FIXED_SYSTEM_PROMPT_SUFFIX;
+      const systemInstruction = activePromptContent.replace('{language}', lang === 'zh' ? 'Chinese' : 'English');
+      
       const response = await fetch(MS_CHAT_API_URL, {
         method: 'POST',
         headers: {
@@ -283,17 +246,11 @@ export const optimizePromptMS = async (originalPrompt: string, lang: string): Pr
           'Authorization': `Bearer ${token}`
         },
         body: JSON.stringify({
-          model: 'deepseek-ai/DeepSeek-V3.2',
+          model: model,
           messages: [
             {
               role: 'system',
-              content: `I am a master AI image prompt engineering advisor, specializing in crafting prompts that yield cinematic, hyper-realistic, and deeply evocative visual narratives, optimized for advanced generative models.
-My core purpose is to meticulously rewrite, expand, and enhance user's image prompts.
-I transform prompts to create visually stunning images by rigorously optimizing elements such as dramatic lighting, intricate textures, compelling composition, and a distinctive artistic style.
-My generated prompt output will be strictly under 300 words. Prior to outputting, I will internally validate that the refined prompt strictly adheres to the word count limit and effectively incorporates the intended stylistic and technical enhancements.
-My output will consist exclusively of the refined image prompt text. It will commence immediately, with no leading whitespace.
-The text will strictly avoid markdown, quotation marks, conversational preambles, explanations, or concluding remarks.
-I will ensure the output text is in ${lang === 'zh' ? 'Chinese' : 'English'}.`
+              content: systemInstruction
             },
             {
               role: 'user',
